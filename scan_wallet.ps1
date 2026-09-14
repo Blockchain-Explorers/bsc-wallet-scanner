@@ -48,14 +48,13 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$resolvedWalletsFile = if ([System.IO.Path]::IsPathRooted($WalletsFile)) { $WalletsFile } else { Join-Path $scriptDir $WalletsFile }
+
 if (-not $WalletAddresses -or $WalletAddresses.Count -eq 0) {
-    $resolvedWalletsFile = if ([System.IO.Path]::IsPathRooted($WalletsFile)) { $WalletsFile } else { Join-Path $scriptDir $WalletsFile }
     if (Test-Path $resolvedWalletsFile) {
         $WalletAddresses = Get-Content $resolvedWalletsFile | Where-Object {
             -not [string]::IsNullOrWhiteSpace($_) -and -not $_.Trim().StartsWith("#")
         }
-    } else {
-        exit 1
     }
 }
 
@@ -84,7 +83,7 @@ $form.ForeColor = [System.Drawing.Color]::White
 # Header Panel
 $headerPanel = New-Object System.Windows.Forms.Panel
 $headerPanel.Dock = "Top"
-$headerPanel.Height = 55
+$headerPanel.Height = 62
 $headerPanel.BackColor = [System.Drawing.Color]::FromArgb(32, 33, 39)
 $form.Controls.Add($headerPanel)
 
@@ -100,20 +99,19 @@ $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Text = "Monitoring $($WatchedList.Count) wallet(s) | Poll: ${PollInterval}s"
 $lblStatus.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $lblStatus.ForeColor = [System.Drawing.Color]::FromArgb(160, 160, 170)
-$lblStatus.Location = New-Object System.Drawing.Point(14, 30)
+$lblStatus.Location = New-Object System.Drawing.Point(14, 36)
 $lblStatus.AutoSize = $true
 $headerPanel.Controls.Add($lblStatus)
 
-# Log Viewer TextBox
-$txtLog = New-Object System.Windows.Forms.TextBox
-$txtLog.Multiline = $true
+# Log Viewer — manually positioned so it always sits exactly between header and footer
+$txtLog = New-Object System.Windows.Forms.RichTextBox
 $txtLog.ScrollBars = "Vertical"
 $txtLog.ReadOnly = $true
-$txtLog.Dock = "Fill"
 $txtLog.BackColor = [System.Drawing.Color]::FromArgb(18, 18, 20)
 $txtLog.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 230)
 $txtLog.Font = New-Object System.Drawing.Font("Consolas", 10)
 $txtLog.BorderStyle = "None"
+$txtLog.Anchor = "Top, Bottom, Left, Right"
 $form.Controls.Add($txtLog)
 
 # Bottom Status Footer & Controls
@@ -122,6 +120,14 @@ $bottomPanel.Dock = "Bottom"
 $bottomPanel.Height = 36
 $bottomPanel.BackColor = [System.Drawing.Color]::FromArgb(32, 33, 39)
 $form.Controls.Add($bottomPanel)
+
+# Position the log box to fill the gap between header (55px) and footer (36px)
+$script:ResizeLog = {
+    $txtLog.Location = New-Object System.Drawing.Point(0, $headerPanel.Height)
+    $txtLog.Size     = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $headerPanel.Height - $bottomPanel.Height))
+}
+$form.Add_Load($script:ResizeLog)
+$form.Add_Resize($script:ResizeLog)
 
 $lblFooter = New-Object System.Windows.Forms.Label
 $lblFooter.Text = "Closing this window minimizes it to the system tray."
@@ -215,10 +221,20 @@ $contextMenu.Items.Add($exitItem) | Out-Null
 
 $trayIcon.ContextMenuStrip = $contextMenu
 
+# Track the last notification URL so clicking the balloon opens it in the browser
+$script:LastNotifUrl = ""
+
+$trayIcon.Add_BalloonTipClicked({
+    if ($script:LastNotifUrl) {
+        Start-Process $script:LastNotifUrl
+    }
+})
+
 function Send-DesktopNotification {
-    param([string]$Title, [string]$Message)
+    param([string]$Title, [string]$Message, [string]$Url = "")
+    $script:LastNotifUrl = $Url
     [Console]::Beep(800, 180)
-    $trayIcon.ShowBalloonTip(7000, $Title, $Message, [System.Windows.Forms.ToolTipIcon]::Info)
+    $trayIcon.ShowBalloonTip(7000, "BSC Monitor | $Title", $Message, [System.Windows.Forms.ToolTipIcon]::Info)
 }
 
 # ------------------------------------------------------------------------------
@@ -361,14 +377,16 @@ function Check-Transfers {
         $bnbDiff   = [Math]::Round($balAfter - $balBefore, 8)
 
         if ($bnbDiff -gt 0.000001) {
-            $logMsg = "[$shortWallet] RECEIVED +$bnbDiff BNB | https://bscscan.com/address/$TargetWallet"
+            $addrUrl = "https://bscscan.com/address/$TargetWallet"
+            $logMsg  = "[$shortWallet] RECEIVED +$bnbDiff BNB | $addrUrl"
             Append-Log $logMsg
-            Send-DesktopNotification -Title "BNB Received [$shortWallet]" -Message "+$bnbDiff BNB"
+            Send-DesktopNotification -Title "BNB Received" -Message "[$shortWallet] +$bnbDiff BNB  (click to open BscScan)" -Url $addrUrl
         } elseif ($bnbDiff -lt -0.000001) {
             $sentAmt = [Math]::Abs($bnbDiff)
-            $logMsg  = "[$shortWallet] SENT -$sentAmt BNB | https://bscscan.com/address/$TargetWallet"
+            $addrUrl = "https://bscscan.com/address/$TargetWallet"
+            $logMsg  = "[$shortWallet] SENT -$sentAmt BNB | $addrUrl"
             Append-Log $logMsg
-            Send-DesktopNotification -Title "BNB Sent [$shortWallet]" -Message "-$sentAmt BNB"
+            Send-DesktopNotification -Title "BNB Sent" -Message "[$shortWallet] -$sentAmt BNB  (click to open BscScan)" -Url $addrUrl
         }
     } catch {}
 
@@ -376,23 +394,29 @@ function Check-Transfers {
     try {
         $logs = Get-Bep20Transfers -WalletAddress $TargetWallet -FromBlockHex $FromBlockHex -ToBlockHex $ToBlockHex
         foreach ($log in $logs) {
-            $contractAddr  = $log.address
+            # Validate: need 3 non-null topics each exactly 66 chars (0x + 64 hex digits)
+            $t0 = "$($log.topics[0])"; $t1 = "$($log.topics[1])"; $t2 = "$($log.topics[2])"
+            if ($log.topics.Count -lt 3 -or $t1.Length -lt 66 -or $t2.Length -lt 66) { continue }
+
+            $contractAddr  = "$($log.address)"
+            if ($contractAddr.Length -lt 6) { continue }
             $shortContract = Short-Address $contractAddr
-            $rawAmount     = Decode-Uint256 $log.data
+            $rawAmount     = Decode-Uint256 "$($log.data)"
 
             # topics[1] = from, topics[2] = to (each padded to 32 bytes)
-            $fromAddr = "0x" + $log.topics[1].Substring(26)
-            $toAddr   = "0x" + $log.topics[2].Substring(26)
-            $txHash   = $log.transactionHash
+            $fromAddr = ("0x" + $t1.Substring(26)).ToLower()
+            $toAddr   = ("0x" + $t2.Substring(26)).ToLower()
+            $txHash   = "$($log.transactionHash)"
+            $txUrl    = "https://bscscan.com/tx/$txHash"
 
             if ($toAddr -eq $TargetWallet) {
-                $logMsg = "[$shortWallet] RECEIVED +$rawAmount Token ($shortContract) | Tx: https://bscscan.com/tx/$txHash"
+                $logMsg = "[$shortWallet] RECEIVED +$rawAmount Token ($shortContract) | Tx: $txUrl"
                 Append-Log $logMsg
-                Send-DesktopNotification -Title "Token Received [$shortWallet]" -Message "+$rawAmount ($shortContract)"
+                Send-DesktopNotification -Title "Token Received" -Message "[$shortWallet] +$rawAmount ($shortContract)  (click to open BscScan)" -Url $txUrl
             } elseif ($fromAddr -eq $TargetWallet) {
-                $logMsg = "[$shortWallet] SENT -$rawAmount Token ($shortContract) | Tx: https://bscscan.com/tx/$txHash"
+                $logMsg = "[$shortWallet] SENT -$rawAmount Token ($shortContract) | Tx: $txUrl"
                 Append-Log $logMsg
-                Send-DesktopNotification -Title "Token Sent [$shortWallet]" -Message "-$rawAmount ($shortContract)"
+                Send-DesktopNotification -Title "Token Sent" -Message "[$shortWallet] -$rawAmount ($shortContract)  (click to open BscScan)" -Url $txUrl
             }
         }
     } catch {}
@@ -401,6 +425,18 @@ function Check-Transfers {
 # ------------------------------------------------------------------------------
 # 6. Startup Initialization & Synchronization
 # ------------------------------------------------------------------------------
+
+# Guard: if no wallets are configured, show a notification and open wallets.txt
+if ($WatchedList.Count -eq 0) {
+    $trayIcon.ShowBalloonTip(10000, "BSC Monitor | No Wallets Configured",
+        "Add at least one BSC address to wallets.txt, then restart.", [System.Windows.Forms.ToolTipIcon]::Warning)
+    Append-Log "No wallet addresses found in wallets.txt."
+    Append-Log "Add at least one BSC address and restart the monitor."
+    Start-Process "notepad.exe" $resolvedWalletsFile
+    [System.Windows.Forms.Application]::Run()
+    exit 0
+}
+
 Append-Log "Started BSC Transfer Monitor."
 Append-Log "Watching $($WatchedList.Count) wallet(s):"
 foreach ($w in $WatchedList) {
